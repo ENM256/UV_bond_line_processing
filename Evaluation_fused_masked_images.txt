@@ -1,0 +1,430 @@
+
+input = "path/IMAGES_FUSED_MASKED/";
+output = "path/IMAGES_FUSED_EVALUATED/";
+output_csv = "path/RESULTS_IJEVAL_BL_WIDTH/";
+output_csv_penetration_list = "path/RESULTS_IJEVAL_PENETRATION_LIST/";
+output_csv_BL_path = "path/RESULTS_IJEVAL_BL_PATH/";
+output_csv_BL_and_holes = "path/RESULTS_IJEVAL_BL_HOLES/";
+
+downsize_factor = [SET]; //factor by which to scale-down the masked image to reduce computation time
+scale_factor = [SET]; // image scale factor (based on imaging hardware) in px/µm after downsizing
+
+close("*"); // close open windows
+
+list = getFileList(input);
+Array.sort(list); //order filelist (0-9 / A-Z)
+
+
+//All images:
+i0=0;
+//start at:
+//i0=0; //index of first file in folder (0-indexed array!)
+
+for (ii = i0; ii < list.length; ii++){ // sample / image loop
+       processing(input, output, list[ii],ii);
+}
+
+
+
+function processing(input, output, filename,k) {
+//load mask image
+open(input + filename);
+
+
+filename=getTitle(); 
+
+print("Evaluation: " + filename);
+getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour_start, minute_start, second_start, msec);
+
+selectWindow(filename);
+run("8-bit"); // if required: convert 1bit images to 8bit (needed for Convert to Mask) 
+
+//downsize mask image for faster processing
+run("Scale...", "x=&downsize_factor y=&downsize_factor interpolation=None average create title=mask_raw");
+run("Convert to Mask");
+run("Invert");
+
+//adjust mask raw image
+selectWindow("mask_raw");
+run("Rotate 90 Degrees Left");
+run("Median...", "radius=1");
+
+////crop image to extend BL to image edges
+run("Duplicate...", "title=mask");
+crop_x1 = 0; //pre-eval-value
+crop_x2 = Image.width; //pre-eval-value
+run("Select All");
+run("Plot Profile");
+run("Find Peaks", "min._peak_amplitude=0 min._peak_distance=0 min._value=254.99 max._value=0.01 list");
+selectWindow("Plot Values"); // 
+BL_0positions = Table.getColumn("X1");
+selectWindow("mask"); // 
+
+if(lengthOf(BL_0positions)==1){
+if(BL_0positions[0]< Image.height) crop_x1 = BL_0positions[0]*2 + 5;
+if(BL_0positions[0]>(Image.width - Image.height)) crop_x2 = Image.width - 2*(Image.width-BL_0positions[0]) - 5;
+}
+if(lengthOf(BL_0positions)>1){
+if(BL_0positions[lengthOf(BL_0positions)-1]< Image.height) crop_x1 = BL_0positions[lengthOf(BL_0positions)-1]*2 + 5;
+if(BL_0positions[0]>(Image.width - Image.height)) crop_x2 = Image.width - 2*(Image.width-BL_0positions[0]) - 5;
+}
+makeRectangle(crop_x1, 0, crop_x2-crop_x1, Image.height);
+run("Crop");
+close("Plot of mask");
+close("Peaks in Plot of mask");
+close("Plot Values");
+
+run("Set Scale...", "distance=&scale_factor known=1 unit=µm"); //set scale of image from px to µm
+
+
+////// create BL masks
+
+//BL only mask (holes filled)
+selectWindow("mask");
+run("Duplicate...", "title=mask_BL_filled_only");
+run("Fill Holes");
+run("Invert");
+run("Fill Holes");
+run("Invert");
+
+//mask (BL holes filled)
+imageCalculator("Min create", "mask","mask_BL_filled_only");
+selectWindow("Result of mask");
+rename("mask_BL_filled_all");
+
+//BL holes only mask
+imageCalculator("Subtract create", "mask","mask_BL_filled_only");
+selectWindow("Result of mask");
+rename("mask_BL_holes");
+run("Invert");
+
+//////
+
+////create BL-path
+selectWindow("mask_BL_filled_only");
+run("Invert");
+run("Duplicate...", "title=BL_skeleton");
+run("Skeletonize (2D/3D)");
+run("Analyze Skeleton (2D/3D)", "prune=none calculate");
+
+//get BL-path selection
+selectWindow("Longest shortest paths");
+run("Set Scale...", "distance=&scale_factor known=1 unit=µm"); //set scale of image from px to µm
+setThreshold(90, 100, "raw");
+run("Create Selection");
+
+////convert BL-path selection from skeleton to poly-line selection for profiling:////
+Roi.getCoordinates(xpoints, ypoints);
+// remove points with duplicate X-position-value
+n = xpoints.length;
+order = Array.rankPositions(xpoints);
+
+xpoints_keep = Array.fill(newArray(n), n);
+ypoints_keep = Array.fill(newArray(n), n);
+
+xpoints_keep[0] = order[0];
+k = 1;
+for (i = 1; i < n; i++) {
+	if(xpoints[order[i]] != xpoints[order[i-1]]) {
+		xpoints_keep[k] = order[i];
+		ypoints_keep[k] = order[i];
+		k++;
+		}
+	}
+xpoints_keep = Array.sort(xpoints_keep); //sort keep-indexes
+for (i = 0; i < k; i++) {
+	if(xpoints_keep[i]<n){
+		keep_index = xpoints_keep[i];
+		xpoints_keep[i] = xpoints[keep_index]; //overwrite keep-indexes with keep-values
+		ypoints_keep[i] = ypoints[keep_index];
+	}
+	else break;	
+	}
+xpoints_keep = Array.slice(xpoints_keep,0,k);
+ypoints_keep = Array.slice(ypoints_keep,0,k);
+Array.sort(xpoints_keep, ypoints_keep); // sort keep values of both x and y coordinates in accending order of array1 (x-coordinate)
+
+
+//remove outer parts of path (diverging) before extending to edges for filling
+outer_width = 500 * scale_factor; //integer in µm to be converted in px
+n2 = xpoints_keep.length;
+k2 = 0;
+xpoints_keep_cut = Array.fill(newArray(n2), n2);
+ypoints_keep_cut = Array.fill(newArray(n2), n2);
+for (i = 0; i < n2; i++) {
+	if(xpoints_keep[i] > outer_width) {
+	if(xpoints_keep[i] < (Image.width - outer_width)) {	
+		xpoints_keep_cut[k2] = xpoints_keep[i];
+		ypoints_keep_cut[k2] = ypoints_keep[i];
+		k2++;
+		}}
+	}
+xpoints_keep_cut = Array.slice(xpoints_keep_cut,0,k2);
+ypoints_keep_cut = Array.slice(ypoints_keep_cut,0,k2);
+xpoints_keep_extended = Array.concat(0,xpoints_keep_cut,Image.width);
+ypoints_keep_extended = Array.concat(ypoints_keep_cut[0],ypoints_keep_cut,ypoints_keep_cut[k2-1]);
+
+////// create Penetration only mask with watershed separation of near-bondline filled lumens
+
+selectWindow("mask_BL_filled_all");
+run("Duplicate...", "title=mask_Penetration_only");
+run("Invert");
+//run("Watershed");//separate penetration areas connected to BL
+run("Adjustable Watershed", "tolerance=0.25");
+run("Invert");
+makeSelection("polyline", xpoints_keep_extended, ypoints_keep_extended);//select BL path 
+run("Line Width...", "line=4");
+setForegroundColor(0, 0, 0);
+run("Draw", "slice"); //reconnect BL
+run("Select None");
+
+
+setForegroundColor(255, 255, 255);//white
+
+floodFill(xpoints_keep_cut[200], ypoints_keep_cut[200]); //remove BL from mask
+setForegroundColor(0, 0, 0);
+
+////// recreate refined BL filled only mask
+imageCalculator("XOR create", "mask_BL_filled_all","mask_Penetration_only");
+selectWindow("Result of mask_BL_filled_all");
+rename("mask_BL_filled_only_refined");
+run("Invert");
+run("Fill Holes"); //remove remaining negative lines from watershed algorithm!
+run("Invert");
+
+////// recreate refined BL filled all mask
+selectWindow("mask_Penetration_only");
+run("Duplicate...", "title=mask_Penetration_only_outlines");
+run("Invert");
+run("Dilate");//extend areas by 1 px (where outline will be). Removes watershed lines from particles
+run("Outline");
+//run("Invert");
+imageCalculator("Add create", "mask_BL_filled_all","mask_Penetration_only_outlines");
+selectWindow("Result of mask_BL_filled_all");
+rename("mask_BL_filled_all_refined");
+
+selectWindow("Tagged skeleton");
+rename("Tagged Skeleton unrefined");
+selectWindow("Longest shortest paths");
+rename("Longest shortest paths unrefined");
+
+////REcreate refined BL-path
+selectWindow("mask_BL_filled_only_refined");
+//run("Invert");
+run("Duplicate...", "title=BL_skeleton_refined");
+run("Skeletonize (2D/3D)");
+run("Analyze Skeleton (2D/3D)", "prune=none calculate");
+	
+//get refined BL-path selection	
+selectWindow("Longest shortest paths");
+run("Set Scale...", "distance=&scale_factor known=1 unit=µm"); //set scale of image from px to µm
+setThreshold(90, 100, "raw");
+run("Create Selection");
+
+////convert BL-path selection from skeleton to poly-line selection for profiling:////
+Roi.getCoordinates(xpoints, ypoints);
+// remove points with duplicate X-position-value
+n = xpoints.length;
+order = Array.rankPositions(xpoints);
+
+xpoints_keep = Array.fill(newArray(n), n);
+ypoints_keep = Array.fill(newArray(n), n);
+
+xpoints_keep[0] = order[0];
+k = 1;
+for (i = 1; i < n; i++) {
+	if(xpoints[order[i]] != xpoints[order[i-1]]) {
+		xpoints_keep[k] = order[i];
+		ypoints_keep[k] = order[i];
+		k++;
+		}
+	}
+xpoints_keep = Array.sort(xpoints_keep); //sort keep-indexes
+for (i = 0; i < k; i++) {
+	if(xpoints_keep[i]<n){
+		keep_index = xpoints_keep[i];
+		xpoints_keep[i] = xpoints[keep_index]; //overwrite keep-indexes with keep-values
+		ypoints_keep[i] = ypoints[keep_index];
+	}
+	else break;	
+	}
+xpoints_keep = Array.slice(xpoints_keep,0,k);
+ypoints_keep = Array.slice(ypoints_keep,0,k);
+Array.sort(xpoints_keep, ypoints_keep); // sort keep values of both x and y coordinates in accending order of array1 (x-coordinate)
+
+
+//Save refined BL path coordinates as CSV 
+run("Clear Results");
+makeSelection("polyline", xpoints_keep, ypoints_keep);
+
+
+getSelectionCoordinates(x_polyline_BL, y_polyline_BL);
+for (j=0; j<x_polyline_BL.length; j++) {
+		setResult("X_pos(px)", j, x_polyline_BL[j]);
+		setResult("Y_pos(px)", j, y_polyline_BL[j]);
+		setResult("X_pos(µm)", j, x_polyline_BL[j]/scale_factor);
+		setResult("Y_pos(µm)", j, y_polyline_BL[j]/scale_factor);
+}
+updateResults;
+
+path = output_csv_BL_path+substring(filename, 0, lengthOf(filename)-10)+"_BL_path.csv";
+saveAs("Results", path);
+run("Clear Results");
+
+
+
+
+//////calculate local thickness and get profile along BL-path
+selectWindow("mask_BL_filled_all_refined");
+run("Invert");
+//run("Invert LUT");
+run("Local Thickness (complete process)", "threshold=128");
+selectWindow("mask_BL_filled_all_refined_LocThk");
+run("Divide...", "value=&scale_factor"); //scale Local Thickness gray values from px to µm
+setMinAndMax(0, 300);//Adjust LUT scale to unify color legend for all images 
+
+run("Set Scale...", "distance=&scale_factor known=1 unit=µm"); // set scale of image from px to µm
+
+
+makeSelection("polyline", xpoints_keep, ypoints_keep);
+
+//calculate profile (scaled)
+  profile = getProfile();
+  for (i=0; i<profile.length; i++){
+      setResult("BL_length_µm", i, i/scale_factor); // length of BL == profile length (px) / scale factor
+      setResult("BL_width_µm", i, profile[i]); //local thickness == gray value (profile)
+      //print(i);
+  }
+  updateResults;
+
+// Save BL_width-profile as CSV
+path = output_csv+substring(filename, 0, lengthOf(filename)-10)+"_BL_width_profile.csv";
+saveAs("Results", path);
+run("Clear Results");
+
+
+// Analyse Penetration and save as CSV
+selectWindow("mask_Penetration_only");
+run("Invert");
+imageCalculator("AND create", "mask_Penetration_only","mask_BL_filled_all_refined_LocThk");
+selectWindow("mask_Penetration_only");
+run("Invert");
+selectWindow("Result of mask_Penetration_only");
+rename("mask_Penetration_only_LocThk");
+run("Fire");
+setMinAndMax(0, 300);//Adjust LUT scale to unify color legend for all images 
+run("Set Measurements...", "area mean standard modal min centroid center perimeter bounding fit shape feret's integrated median skewness kurtosis area_fraction redirect=None decimal=3");
+setAutoThreshold("Default dark");
+setThreshold(1, 255);
+run("Analyze Particles...", "display");
+resetThreshold();
+path = output_csv_penetration_list+substring(filename, 0, lengthOf(filename)-10)+"_penetration_list.csv";
+saveAs("Results", path);
+run("Clear Results");
+
+// Analyse Bondline total area and Holes in BL and save as CSV
+selectWindow("mask_BL_filled_only_refined");
+setThreshold(129, 255, "raw");
+run("Analyze Particles...", "display"); // first rows in result list (255/white): Bond Line filled 
+resetThreshold();
+selectWindow("mask_BL_holes");
+setThreshold(0, 128);
+run("Analyze Particles...", "display"); // following rows in result list (0/black): Holes in bond line
+resetThreshold();
+path = output_csv_BL_and_holes+substring(filename, 0, lengthOf(filename)-10)+"_BL_and_holes.csv";
+saveAs("Results", path);
+
+
+
+
+//// VISUALIZATION OF EVALUATION //// 
+scale_fontsize = 300 * downsize_factor;
+calibrationbar_fontsize = 80 * downsize_factor;
+///Segmentation of Penetration, Bond Line and Holes with colors
+//load segmentation color legend
+open("path/Segmentation_Color_Legend.tiff");
+run("Scale...", "x=&downsize_factor y=&downsize_factor interpolation=None average create title=Segmentation_Color_Legend");
+selectWindow("mask_BL_filled_only_refined");
+run("RGB Color");
+setMinAndMax(255, 255, 5);//white-to-green
+selectWindow("mask_BL_holes");
+run("Invert");
+run("RGB Color");
+setMinAndMax(255, 255, 2);//white-to-magenta
+selectWindow("mask_Penetration_only");
+run("Invert");
+run("RGB Color");
+setMinAndMax(255, 255, 1);//white-to-yellow
+imageCalculator("OR create", "mask_BL_filled_only_refined","mask_BL_holes");
+selectWindow("Result of mask_BL_filled_only_refined");
+imageCalculator("Add create", "Result of mask_BL_filled_only_refined","mask_Penetration_only");
+selectWindow("Result of Result of mask_BL_filled_only_refined");
+run("Invert");
+rename("mask_color_segmentation");
+run("Add Image...", "image=Segmentation_Color_Legend x=10 y=10 opacity=100");
+run("Scale Bar...", "width=1000 height=100 thickness=40 font=&scale_fontsize color=Black background=None location=[Lower Right] horizontal bold overlay");
+run("Flatten");
+
+
+///Skeleton with increased line thickness and red BL path
+selectWindow("BL_skeleton_refined");
+run("Invert");
+run("Erode");
+run("Erode");
+run("Erode");
+run("Erode");
+run("Erode");
+run("Erode");
+run("Erode");
+run("Erode");
+
+run("Line Width...", "line=10");
+setForegroundColor(255, 0, 0);
+run("RGB Color");
+makeSelection("polyline", xpoints_keep, ypoints_keep);
+run("Draw", "slice");
+run("Select None");
+run("Line Width...", "line=1");
+setForegroundColor(0, 0, 0);
+run("Add Image...", "image=mask x=0 y=0 opacity=35");
+run("Scale Bar...", "width=1000 height=100 thickness=40 font=&scale_fontsize color=Black background=None location=[Lower Right] horizontal bold overlay");
+run("Flatten");
+
+
+/// Local Thickness image with annotations
+selectWindow("mask_BL_filled_all_refined_LocThk");
+run("Duplicate...", "title=mask_BL_filled_all_refined_LocThk_labeled");
+//add scale and color bars
+run("Scale Bar...", "width=1000 height=100 thickness=40 font=&scale_fontsize color=White background=None location=[Lower Right] horizontal bold overlay");
+run("Calibration Bar...", "location=[Upper Left] fill=None label=White number=3 decimal=0 font=&calibrationbar_fontsize zoom=3 overlay");
+run("Flatten");
+
+///create montage summary image
+selectWindow("mask_BL_filled_all_refined_LocThk_labeled-1");
+image_summary_width = Image.width;
+image_summary_height = Image.height*3+200;
+newImage("eval_summary", "8-bit white", image_summary_width, image_summary_height, 1);
+run("Add Image...", "image=mask_BL_filled_all_refined_LocThk_labeled-1 x=0 y=0 opacity=100");
+y_pos_img=(image_summary_height-200)/3+100;
+run("Add Image...", "image=BL_skeleton_refined-1 x=0 y=&y_pos_img opacity=100");
+y_pos_img=2*(image_summary_height-200)/3+200;
+run("Add Image...", "image=mask_color_segmentation-1 x=0 y=&y_pos_img opacity=100");
+
+run("Flatten");
+saveAs("PNG", output  + filename.substring(0,lengthOf(filename)-10)+"_eval_summary.png");
+
+//////////
+
+
+
+getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour_end, minute_end, second_end, msec);
+eval_duration_s = 3600*(hour_end-hour_start) + 60*(minute_end-minute_start) + (second_end-second_start);
+print(filename + " evaluated in " + eval_duration_s + " seconds");
+
+
+
+close("*");
+run("Clear Results");
+run("Collect Garbage"); // delete unused memory 
+
+}
